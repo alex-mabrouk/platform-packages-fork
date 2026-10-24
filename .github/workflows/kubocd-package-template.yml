@@ -127,7 +127,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: alex-mabrouk/okdp-contract
-          ref: v0.1.13
+          ref: v0.1.14
           token: ${{ secrets.OKDP_CONTRACT_READ_TOKEN }}
           path: .tmp/okdp-contract
           persist-credentials: false
