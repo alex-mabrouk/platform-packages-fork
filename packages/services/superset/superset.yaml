@@ -16,7 +16,7 @@
 
 apiVersion: v1alpha1
 name: superset
-tag: 2.0.0-alpha.6 # x-release-please-version
+tag: 2.0.0-alpha.8 # x-release-please-version
 description: |
   Apache Superset - Enterprise business intelligence platform for modern data teams.
   Self-service analytics tool that enables users to create interactive dashboards, explore datasets,
@@ -24,7 +24,7 @@ description: |
 usage:
   text: |
     Apache Superset provides modern data visualization and exploration capabilities.
-    Access the UI at https://superset-{{ .Release.spec.targetNamespace }}.{{ .Context.ingress.suffix }}
+    Access the UI at https://{{ trimPrefix (printf "%s-" .Release.spec.targetNamespace) .Release.metadata.name }}-{{ .Release.spec.targetNamespace }}.{{ .Context.ingress.suffix }}
 # OKDP package descriptor (contract 0.2). Name and version are the name and tag
 # above. Its parameters are the single source of schema.parameters below.
 extensions:
@@ -64,7 +64,7 @@ extensions:
       $schema: https://json-schema.org/draft/2020-12/schema
       type: object
       additionalProperties: false
-      required: [metadataDb, examplesDb, redis]
+      required: [metadataDb, examplesDb]
       properties:
         metadataDb:
           type: string
@@ -75,13 +75,25 @@ extensions:
           x-okdp-order: 1
           x-okdp-connection: metadata-db
         redis:
-          type: string
-          minLength: 1
-          title: Redis-compatible connection
-          description: "Redis-compatible cache and Celery broker. Select an okdp-valkey instance or an external compatible service."
+          type: object
+          additionalProperties: false
+          default: { mode: embedded }
+          title: Cache and Celery broker
+          description: "embedded deploys a Valkey dedicated to this instance. external uses a redis-compatible Connection, a valkey instance or an external service."
           x-okdp-group: Cluster
           x-okdp-order: 2
-          x-okdp-connection: redis-compatible
+          properties:
+            mode:
+              type: string
+              enum: [embedded, external]
+              default: embedded
+              title: Mode
+            connection:
+              type: string
+              minLength: 1
+              title: Redis-compatible connection
+              description: "Name of the redis-compatible Connection, required when mode is external."
+              x-okdp-connection: redis-compatible
         load_examples:
           type: boolean
           default: true
@@ -201,7 +213,8 @@ extensions:
         - name: redis-compatible
           contract: redis-compatible
           version: "1"
-          description: Redis-compatible cache and Celery broker
+          optional: true
+          description: Redis-compatible cache and Celery broker, when redis.mode is external
     endpoints:
       - name: ui
         kind: ui
@@ -253,7 +266,7 @@ inputs:
   - { contract: database-server, alias: metadata-db, fromParameter: metadataDb }
   - { contract: database-server, alias: examples-db, fromParameter: examplesDb }
   - { contract: trino, alias: trino, fromParameter: "datasources[].trino" }
-  - { contract: redis-compatible, alias: redis-compatible, fromParameter: redis }
+  - { contract: redis-compatible, alias: redis-compatible, fromParameter: redis.connection, optional: true }
 
 modules:
   # The OIDC clients, registered with the platform when it provisions them (dcr).
@@ -268,6 +281,7 @@ modules:
     values: |
       {{- $namespace := printf "%v" .Release.spec.targetNamespace -}}
       {{- $release := printf "%v" .Release.metadata.name -}}
+      {{- $supersetHost := printf "%s-%s.%s" (trimPrefix (printf "%s-" $namespace) $release) $namespace .Context.ingress.suffix -}}
       {{- $dcr := .Context.oidc.dcr | default dict -}}
       {{- $grantee := splitList "/" ($dcr.grantee | default "oidc-system/oidc-client-operator") -}}
       {{- if ne (len $grantee) 2 }}{{ fail "oidc.dcr.grantee must be <namespace>/<serviceaccount>" }}{{ end }}
@@ -282,7 +296,7 @@ modules:
           client:
             grantTypes: [authorization_code, refresh_token]
             redirectUris:
-              - "https://superset-{{ $namespace }}.{{ .Context.ingress.suffix }}/oauth-authorized/{{ .Context.oidc.displayName | default "keycloak" }}"
+              - "https://{{ $supersetHost }}/oauth-authorized/{{ .Context.oidc.displayName | default "keycloak" }}"
             scopes: {{ $scopes | toJson }}
           credentials:
             secretName: {{ $release }}-oidc
@@ -290,7 +304,7 @@ modules:
           client:
             grantTypes: [authorization_code, refresh_token]
             redirectUris:
-              - "https://superset-{{ $namespace }}.{{ .Context.ingress.suffix }}/api/v1/database/oauth2/"
+              - "https://{{ $supersetHost }}/api/v1/database/oauth2/"
             scopes: {{ $scopes | toJson }}
           credentials:
             secretName: {{ $release }}-oidc-trino
@@ -306,10 +320,48 @@ modules:
             - fieldName: superset_secret_key
               encoding: base64
               length: "42"
+        {{- if eq ((.Parameters.redis | default dict).mode | default "embedded") "embedded" }}
+        - name: "creds-{{ .Release.metadata.name }}-valkey"
+          data:
+            username: default
+          fields:
+            # hex: the password lands in a redis:// URL, where base64 padding would need escaping.
+            - fieldName: password
+              encoding: hex
+              length: "32"
+        {{- end }}
+
+  # The Valkey of this instance alone, when redis.mode is embedded.
+  - name: valkey
+    enabled: '{{ eq ((.Parameters.redis | default dict).mode | default "embedded") "embedded" }}'
+    timeout: 10m
+    source:
+      helmRepository:
+        url: https://valkey.io/valkey-helm/
+        chart: valkey
+        version: 0.12.0
+    values: |
+      fullnameOverride: {{ .Release.metadata.name }}-valkey
+      auth:
+        enabled: true
+        usersExistingSecret: "creds-{{ .Release.metadata.name }}-valkey"
+        aclUsers:
+          default:
+            permissions: "~* &* +@all"
+            passwordKey: password
+      # A single ReadWriteOnce volume: the old pod must stop before the new one mounts it.
+      deploymentStrategy: Recreate
+      dataStorage:
+        enabled: true
+        requestedSize: 1Gi
+
   - name: main
     dependsOn: |
       {{- if eq (.Context.oidc.clientProvisioning | default "dcr") "dcr" }}
       - oidc-dcr
+      {{- end }}
+      {{- if eq ((.Parameters.redis | default dict).mode | default "embedded") "embedded" }}
+      - valkey
       {{- end }}
     timeout: 10m
     source:
@@ -322,7 +374,12 @@ modules:
       {{- $release := printf "%v" .Release.metadata.name -}}
       {{- $metadataDb := index .Inputs "metadata-db" -}}
       {{- $examplesDb := index .Inputs "examples-db" -}}
-      {{- $redis := index .Inputs "redis-compatible" -}}
+      {{- $redisMode := (.Parameters.redis | default dict).mode | default "embedded" -}}
+      {{- $redis := dict "host" (printf "%s-valkey.%s.svc.cluster.local" $release $namespace) "port" 6379 "tls" false "secretRef" (printf "creds-%s-valkey" $release) -}}
+      {{- if eq $redisMode "external" }}
+      {{- $redis = index .Inputs "redis-compatible" -}}
+      {{- if not $redis }}{{ fail "redis.mode is external: redis.connection must name a redis-compatible Connection" }}{{ end }}
+      {{- end }}
       {{- $oidcEnabled := true -}}
       {{- if hasKey .Context.oidc "enabled" }}{{- $oidcEnabled = .Context.oidc.enabled -}}{{ end -}}
       {{- $oidcUsePKCE := true -}}
@@ -348,7 +405,7 @@ modules:
       {{- range $groups }}{{ $_ := set $supersetGroupRoles . (append (get $supersetGroupRoles . | default list) $role) }}{{ end }}
       {{- end }}
 
-      {{- $supersetHost := printf "superset-%s.%s" $namespace $domain -}}
+      {{- $supersetHost := printf "%s-%s.%s" (trimPrefix (printf "%s-" $namespace) $release) $namespace $domain -}}
 
       {{- $d3FormatOverrides := .Parameters.d3Format | default dict -}}
       {{- $d3TimeFormatOverrides := .Parameters.d3TimeFormat | default dict -}}
@@ -533,7 +590,7 @@ modules:
         postgresql:
           # Use an external database
           enabled: false
-        # Redis-compatible service is a required connection, managed by okdp-valkey or external.
+        # The Bitnami subchart stays off: the Valkey module or a redis-compatible Connection serves instead.
         redis:
           enabled: false
         extraEnvRaw:
@@ -727,6 +784,12 @@ modules:
           oauth_to_superset_roles_mapping: *oauth2_superset_roles_mapping
           extra_config: *extra_config
           feature_flags: *feature_flags
+          # An external service may serve several instances: their keys and Celery queue stay apart.
+          redis_isolation: |
+            CACHE_CONFIG = {**CACHE_CONFIG, "CACHE_KEY_PREFIX": "{{ $release }}_"}
+            DATA_CACHE_CONFIG = {**DATA_CACHE_CONFIG, "CACHE_KEY_PREFIX": "{{ $release }}_data_"}
+            RESULTS_BACKEND.key_prefix = "{{ $release }}_results"
+            CeleryConfig.task_default_queue = "{{ $release }}"
 
         extraVolumes:
           - name: cacerts
