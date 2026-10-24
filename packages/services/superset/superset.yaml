@@ -77,22 +77,16 @@ extensions:
         redis:
           type: object
           additionalProperties: false
-          default: { mode: embedded }
           title: Cache and Celery broker
-          description: "embedded deploys a Valkey dedicated to this instance. external uses a redis-compatible Connection, a valkey instance or an external service."
+          description: "A redis-compatible Connection (a valkey instance or an external service), or without one a Valkey dedicated to this instance."
           x-okdp-group: Cluster
           x-okdp-order: 2
           properties:
-            mode:
-              type: string
-              enum: [embedded, external]
-              default: embedded
-              title: Mode
             connection:
               type: string
               minLength: 1
               title: Redis-compatible connection
-              description: "Name of the redis-compatible Connection, required when mode is external."
+              description: "Name of the redis-compatible Connection. Without one, the instance deploys its own Valkey."
               x-okdp-connection: redis-compatible
         load_examples:
           type: boolean
@@ -214,7 +208,8 @@ extensions:
           contract: redis-compatible
           version: "1"
           optional: true
-          description: Redis-compatible cache and Celery broker, when redis.mode is external
+          description: Redis-compatible cache and Celery broker
+          whenAbsent: Deploy a dedicated Valkey
     endpoints:
       - name: ui
         kind: ui
@@ -323,7 +318,7 @@ modules:
             - fieldName: superset_secret_key
               encoding: base64
               length: "42"
-        {{- if eq ((.Parameters.redis | default dict).mode | default "embedded") "embedded" }}
+        {{- if not (.Parameters.redis | default dict).connection }}
         - name: "creds-{{ .Release.metadata.name }}-valkey"
           data:
             username: default
@@ -334,9 +329,9 @@ modules:
               length: "32"
         {{- end }}
 
-  # The Valkey of this instance alone, when redis.mode is embedded.
+  # The Valkey of this instance alone, when no redis-compatible Connection is named.
   - name: valkey
-    enabled: '{{ eq ((.Parameters.redis | default dict).mode | default "embedded") "embedded" }}'
+    enabled: '{{ not (.Parameters.redis | default dict).connection }}'
     timeout: 10m
     source:
       helmRepository:
@@ -363,7 +358,7 @@ modules:
       {{- if eq (.Context.oidc.clientProvisioning | default "dcr") "dcr" }}
       - oidc-dcr
       {{- end }}
-      {{- if eq ((.Parameters.redis | default dict).mode | default "embedded") "embedded" }}
+      {{- if not (.Parameters.redis | default dict).connection }}
       - valkey
       {{- end }}
     timeout: 10m
@@ -377,11 +372,10 @@ modules:
       {{- $release := printf "%v" .Release.metadata.name -}}
       {{- $metadataDb := index .Inputs "metadata-db" -}}
       {{- $examplesDb := index .Inputs "examples-db" -}}
-      {{- $redisMode := (.Parameters.redis | default dict).mode | default "embedded" -}}
       {{- $redis := dict "host" (printf "%s-valkey.%s.svc.cluster.local" $release $namespace) "port" 6379 "tls" false "secretRef" (printf "creds-%s-valkey" $release) -}}
-      {{- if eq $redisMode "external" }}
+      {{- if (.Parameters.redis | default dict).connection }}
       {{- $redis = index .Inputs "redis-compatible" -}}
-      {{- if not $redis }}{{ fail "redis.mode is external: redis.connection must name a redis-compatible Connection" }}{{ end }}
+      {{- if not $redis }}{{ fail "redis.connection names no redis-compatible Connection" }}{{ end }}
       {{- end }}
       {{- $oidcEnabled := true -}}
       {{- if hasKey .Context.oidc "enabled" }}{{- $oidcEnabled = .Context.oidc.enabled -}}{{ end -}}
