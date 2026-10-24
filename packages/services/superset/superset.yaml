@@ -16,7 +16,7 @@
 
 apiVersion: v1alpha1
 name: superset
-tag: 2.0.0-alpha.8 # x-release-please-version
+tag: 2.0.0-alpha.9 # x-release-please-version
 description: |
   Apache Superset - Enterprise business intelligence platform for modern data teams.
   Self-service analytics tool that enables users to create interactive dashboards, explore datasets,
@@ -309,6 +309,8 @@ modules:
           credentials:
             secretName: {{ $release }}-oidc-trino
 
+  # The secret key encrypts fields of the metadata database. Kept when the
+  # Release goes away, the database outlives it.
   - name: internal-secrets
     source:
       local:
@@ -316,6 +318,7 @@ modules:
     values: |
       secrets:
         - name: "creds-{{ .Release.metadata.name }}-internal"
+          keep: true
           fields:
             - fieldName: superset_secret_key
               encoding: base64
