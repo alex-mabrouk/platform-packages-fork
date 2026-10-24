@@ -54,6 +54,10 @@ extensions:
       - capability: okdp.io/identity-client-registration
         providerScope: system-wide
         optional: true
+      # Required when a database is left to the instance (no metadata-db or examples-db Connection).
+      - capability: okdp.io/operator/postgresql.cnpg.io
+        providerScope: system-wide
+        optional: true
       - capability: okdp.io/platform-tools
         providerScope: system-wide
       - capability: okdp.io/secrets-backend
@@ -64,13 +68,12 @@ extensions:
       $schema: https://json-schema.org/draft/2020-12/schema
       type: object
       additionalProperties: false
-      required: [metadataDb, examplesDb]
       properties:
         metadataDb:
           type: string
           minLength: 1
           title: Metadata database
-          description: "Name of the database-server Connection hosting the Superset metadata."
+          description: "Name of the database-server Connection hosting the Superset metadata. Without one, the instance deploys its own PostgreSQL."
           x-okdp-group: Cluster
           x-okdp-order: 1
           x-okdp-connection: metadata-db
@@ -99,7 +102,7 @@ extensions:
           type: string
           minLength: 1
           title: Examples database
-          description: "Name of the database-server Connection hosting the Superset examples, used when load_examples is true."
+          description: "Name of the database-server Connection hosting the Superset examples, used when load_examples is true. Without one, the examples go to the instance's own PostgreSQL."
           x-okdp-group: Cluster
           x-okdp-order: 3
           x-okdp-connection: examples-db
@@ -195,11 +198,15 @@ extensions:
         - name: metadata-db
           contract: database-server
           version: "1"
+          optional: true
           description: Database hosting the Superset metadata
+          whenAbsent: Deploy a dedicated PostgreSQL
         - name: examples-db
           contract: database-server
           version: "1"
+          optional: true
           description: Database hosting the Superset examples
+          whenAbsent: Use the dedicated PostgreSQL
         - name: trino
           contract: trino
           version: "1"
@@ -258,8 +265,8 @@ schema:
           className: { type: string, required: true }
 
 inputs:
-  - { contract: database-server, alias: metadata-db, fromParameter: metadataDb }
-  - { contract: database-server, alias: examples-db, fromParameter: examplesDb }
+  - { contract: database-server, alias: metadata-db, fromParameter: metadataDb, optional: true }
+  - { contract: database-server, alias: examples-db, fromParameter: examplesDb, optional: true }
   - { contract: trino, alias: trino, fromParameter: "datasources[].trino" }
   - { contract: redis-compatible, alias: redis-compatible, fromParameter: redis.connection, optional: true }
 
@@ -329,6 +336,35 @@ modules:
               length: "32"
         {{- end }}
 
+  # The PostgreSQL of this instance alone, for each database no Connection names. The examples
+  # loader writes into the main schema (search_path=main).
+  - name: postgresql
+    enabled: '{{ or (not .Parameters.metadataDb) (and .Parameters.load_examples (not .Parameters.examplesDb)) }}'
+    timeout: 10m
+    source:
+      helmRepository:
+        url: https://cloudnative-pg.github.io/charts
+        chart: cluster
+        version: 0.9.0
+    values: |
+      fullnameOverride: {{ .Release.metadata.name }}-pg
+      version:
+        postgresql: "18"
+      cluster:
+        instances: 1
+        # A single instance: a PodDisruptionBudget would block every node drain.
+        enablePDB: false
+        enableSuperuserAccess: false
+        storage:
+          size: 2Gi
+        initdb:
+          database: superset
+          owner: superset
+          postInitApplicationSQL:
+            - CREATE SCHEMA IF NOT EXISTS main AUTHORIZATION superset
+      backups:
+        enabled: false
+
   # The Valkey of this instance alone, when no redis-compatible Connection is named.
   - name: valkey
     enabled: '{{ not (.Parameters.redis | default dict).connection }}'
@@ -358,6 +394,9 @@ modules:
       {{- if eq (.Context.oidc.clientProvisioning | default "dcr") "dcr" }}
       - oidc-dcr
       {{- end }}
+      {{- if or (not .Parameters.metadataDb) (and .Parameters.load_examples (not .Parameters.examplesDb)) }}
+      - postgresql
+      {{- end }}
       {{- if not (.Parameters.redis | default dict).connection }}
       - valkey
       {{- end }}
@@ -370,8 +409,11 @@ modules:
 
       {{- $namespace := printf "%v" .Release.spec.targetNamespace -}}
       {{- $release := printf "%v" .Release.metadata.name -}}
-      {{- $metadataDb := index .Inputs "metadata-db" -}}
-      {{- $examplesDb := index .Inputs "examples-db" -}}
+      {{- $ownDb := dict "host" (printf "%s-pg-rw.%s.svc.cluster.local" $release $namespace) "port" 5432 "dbName" "superset" "secretRef" (printf "%s-pg-app" $release) -}}
+      {{- $metadataDb := $ownDb -}}
+      {{- if .Parameters.metadataDb }}{{ $metadataDb = index .Inputs "metadata-db" }}{{ end -}}
+      {{- $examplesDb := $ownDb -}}
+      {{- if .Parameters.examplesDb }}{{ $examplesDb = index .Inputs "examples-db" }}{{ end -}}
       {{- $redis := dict "host" (printf "%s-valkey.%s.svc.cluster.local" $release $namespace) "port" 6379 "tls" false "secretRef" (printf "creds-%s-valkey" $release) -}}
       {{- if (.Parameters.redis | default dict).connection }}
       {{- $redis = index .Inputs "redis-compatible" -}}
