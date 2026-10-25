@@ -171,7 +171,12 @@ extensions:
           type: object
           additionalProperties: false
           title: Access
-          description: "Groups granted each Superset role, matched against the groups claim."
+          description: "Groups granted each Superset role, matched against the groups claim. Without a match, a user gets the Public role, which sees nothing."
+          default:
+            Admin: [platform_admin]
+            Alpha: [data_engineer, data_scientist]
+            Gamma: [business_analyst, data_steward, auditor]
+            sql_lab: [data_engineer, data_scientist, data_steward]
           properties:
             Admin: { type: array, items: { type: string, minLength: 1 } }
             Alpha: { type: array, items: { type: string, minLength: 1 } }
