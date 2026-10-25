@@ -106,6 +106,7 @@ extensions:
           x-okdp-group: Cluster
           x-okdp-order: 3
           x-okdp-connection: examples-db
+          x-okdp-visible-when: { parameter: load_examples, equals: true }
         # Chart number and date formats. Any CLDR locale works, the tables come from Babel
         locale:
           type: string
